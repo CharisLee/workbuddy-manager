@@ -325,6 +325,7 @@
     "title": "Usage",
     "description": "Token consumption and request volume by time, model and key (auto-refresh every 60s; currently {realm} only)",
     "today": "Today",
+    "yesterday": "Yesterday",
     "last7": "Last 7 days",
     "last30": "Last 30 days",
     "last3": "Last 3 days",
@@ -381,7 +382,8 @@
     "costUnpriced": "{n} calls not priced",
     "costNote": "Estimated with the list price in effect at each call (peak/off-peak, cache hit/miss). For reference only; the credits actually deducted are shown above.",
     "colCost": "Cost",
-    "costUnavailableHint": "Model has no price entry, so it shows — rather than 0"
+    "costUnavailableHint": "Model has no price entry, so it shows — rather than 0",
+    "realtimeUnlimited": "Unlimited"
   },
   "accounts": {
     "badgeBanned": "● Account banned",
