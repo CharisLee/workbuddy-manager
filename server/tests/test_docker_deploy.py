@@ -915,6 +915,47 @@ class ReleasePackageIncludesDockerAssetsTest(unittest.TestCase):
                           f'发布包没打进去 {asset} —— 用户拿到包也用不了容器部署')
 
 
+class BuildImageWorkflowTagContractTest(unittest.TestCase):
+    """默认分支镜像构建工作流不得占用发布标签。
+
+    `release.yml` 在发版时推 `:<版本号>` 与 `:latest`，它们是对用户的承诺：
+    钉 `:2.11.23` 拉到的字节必须永远对应 v2.11.23 那个 release。
+
+    而 `build-image.yml` 跑在每次 push 默认分支之后，此时 `server/main.py` 的
+    版本号还是**上一个已发布版本**（只在发版提交里 +1）。若它也推版本号或
+    `:latest`，发版后任何普通提交都会把 `:2.11.23` 覆盖成未发布代码 ——
+    用户钉版本拉到的字节悄悄变了，且没有任何报错。
+
+    所以这里锁两条：工作流存在（有预构建镜像可用），且它只用 sha-* 与分支名
+    这类滚动标签。
+    """
+
+    def _workflow(self) -> str:
+        path = _ROOT / '.github' / 'workflows' / 'build-image.yml'
+        self.assertTrue(path.is_file(), '缺少默认分支镜像构建工作流')
+        return path.read_text(encoding='utf-8')
+
+    def test_tags_do_not_collide_with_release(self) -> None:
+        wf = self._workflow()
+        # 只看真正写进 tags 的那段，避免被注释里的解释误判。
+        self.assertNotRegex(
+            wf, r'(?m)^\s*(echo\s+")?' r'\$\{IMAGE\}:latest',
+            '不要推 :latest —— 那是发版契约，会被未发布代码覆盖')
+        self.assertNotIn('${IMAGE}:${VERSION}', wf,
+                         '不要推 :<版本号> —— 版本号只在发版时前进，'
+                         '这里推会把已发布的 tag 覆盖成未发布代码')
+
+    def test_uses_content_addressed_tag(self) -> None:
+        wf = self._workflow()
+        self.assertIn('sha-${SHORT}', wf, '缺少内容寻址标签 sha-<短哈希>')
+
+    def test_builds_both_architectures(self) -> None:
+        wf = self._workflow()
+        line = next((l for l in wf.splitlines() if 'platforms:' in l), '')
+        self.assertIn('linux/amd64', line)
+        self.assertIn('linux/arm64', line, 'ARM 用户拉不到镜像')
+
+
 class MultiArchImageTest(unittest.TestCase):
     """镜像必须同时支持 amd64 与 arm64。
 
@@ -1484,11 +1525,132 @@ class EntrypointPermissionsTest(unittest.TestCase):
                       '.env.example 没给出 PUID，用户不知道该填什么')
 
     def test_image_installs_su_exec_and_shadow(self) -> None:
+        """su-exec / shadow 必须在**运行阶段**装，不能只在别的阶段装。
+
+        为什么必须限定阶段（issue #473 的现场）：这个断言原先只对全文做
+        `apk add[^\n]*su-exec` 匹配，而 `bins` 阶段那一行就满足了 —— 于是
+        v2.11.22 带着「运行阶段没有 su-exec」的镜像发了出去，容器启动几毫秒后
+        `exec: line 161: su-exec: not found`、exit 127、无限重启。
+
+        跨阶段 `COPY` 只搬文件，不会带来 apk 的依赖解析与 /etc/passwd 钩子，
+        所以在 `bins` 里装对运行阶段毫无帮助。这里切出最后一个 `FROM` 之后的
+        内容，只在运行阶段的 RUN 里找。
+        """
         df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
-        self.assertRegex(df, r'apk add[^\n]*su-exec',
-                         'Alpine 没有 su-exec，必须显式安装')
-        self.assertRegex(df, r'apk add[^\n]*shadow',
-                         'busybox 的 adduser 没有 usermod/groupmod，必须装 shadow')
+        # 运行阶段 = 最后一个 FROM 之后（多阶段构建里最后一个就是最终镜像）。
+        runtime = df.rsplit('\nFROM ', 1)[-1]
+        self.assertRegex(runtime, r'apk add[^\n]*su-exec',
+                         '运行阶段没有 su-exec：入口脚本降权会 exit 127')
+        self.assertRegex(runtime, r'apk add[^\n]*shadow',
+                         '运行阶段没有 shadow：busybox 的 adduser 没有 '
+                         'usermod/groupmod，PUID/PGID 对齐全失效')
+
+    def test_runtime_stage_tools_cover_entrypoint_commands(self) -> None:
+        """入口脚本调用的外部工具，运行阶段都得装。
+
+        这是 #473 的一般化防线：不只盯 su-exec/shadow 两个名字，而是把入口脚本里
+        **明确作为命令执行**的外部工具抽出来，逐个确认运行阶段的 `apk add` 覆盖到
+        了。往入口脚本里加一个新工具却忘了装包时，这条会先红。
+        """
+        df = (_ROOT / 'Dockerfile').read_text(encoding='utf-8')
+        runtime = df.rsplit('\nFROM ', 1)[-1]
+        entry = (_ROOT / 'deploy' / 'docker-entrypoint.sh').read_text(encoding='utf-8')
+
+        # 运行阶段 apk add 的包名 → 它提供的可执行文件。
+        PACKAGE_BINARIES = {
+            'su-exec': {'su-exec'},
+            'shadow': {'usermod', 'groupmod'},
+            'curl': {'curl'},
+            'git': {'git'},
+        }
+        installed: set[str] = set()
+        for m in re.finditer(r'apk add[^\n]*', runtime):
+            # 行尾有 `;` 与续行反斜杠，按空白切完还要剥掉标点。
+            for word in re.findall(r'[A-Za-z][\w-]*', m.group(0)):
+                installed |= PACKAGE_BINARIES.get(word, set())
+
+        # 只认「行首 / 条件后 / 管道后」这种命令起始位置的候选词，再排除 shell
+        # 关键字与函数名。这样 `$(dirname ...)`、`[ -x ... ]`、heredoc 里的 Python
+        # 都不会被当成外部命令。
+        SHELL_KEYWORDS = {
+            'if', 'then', 'else', 'elif', 'fi', 'for', 'do', 'done', 'case', 'esac',
+            'while', 'until', 'return', 'exit', 'local', 'export', 'set', 'shift',
+            'trap', 'exec', 'wait', 'true', 'false', 'echo', 'cd', 'test', 'command',
+            'break', 'continue', 'unset', 'readonly', 'eval', 'source', '.',
+            # busybox/基础镜像自带
+            'stat', 'awk', 'dirname', 'readlink', 'cat', 'rm', 'mkdir', 'chown',
+            'chmod', 'id', 'kill', 'sed', 'cp', 'mv', 'ln', 'ls', 'grep', 'tr',
+        }
+        # 本脚本内定义的函数（不是外部命令）。
+        defined = set(re.findall(r'(?m)^([A-Za-z_][\w]*)\s*\(\)\s*\{', entry))
+
+        used: set[str] = set()
+        in_heredoc = False
+        for raw in entry.splitlines():
+            line = raw.strip()
+            if in_heredoc:
+                if line.startswith(heredoc_end):  # type: ignore[possibly-undefined]
+                    in_heredoc = False
+                continue
+            if not line or line.startswith('#'):
+                continue
+            # 剥掉行内注释：`detect() {  # $1 = u | g` 的 `| g` 不是管道命令。
+            # 只在 ` #` 处切，避免误伤 `${VAR#prefix}` 这类参数展开。
+            line = re.split(r'\s#\s', line, maxsplit=1)[0].rstrip()
+            if not line:
+                continue
+            m = re.search(r'<<-?\s*[\'"]?([A-Za-z_][\w]*)', line)
+            if m:
+                heredoc_end = m.group(1)
+                in_heredoc = True
+            # 命令起始位置：行首、`; ` `&&` `||` `|` `(` 之后、`then/do/else` 之后。
+            # 要求候选词后面紧跟空白或行尾 —— 否则 `-o -g "$PGID"` 里的 `g`、
+            # `--supervise` 里的词也会被误当成命令。
+            for cm in re.finditer(
+                    r'(?:^|[;&|(]|\bthen\b|\bdo\b|\belse\b)\s*'
+                    r'([a-z][a-z0-9_-]*)(?=\s|$)', line):
+                used.add(cm.group(1))
+
+        missing = sorted(used - installed - SHELL_KEYWORDS - defined)
+        self.assertEqual([], missing,
+                         '入口脚本用到但运行阶段没有的命令：%s（#473 同类问题）'
+                         % ', '.join(missing))
+
+    def test_skip_ownership_still_generates_upstream_config(self) -> None:
+        """`WB_FIX_OWNERSHIP=0` 只该跳过 chown，不该跳过首启配置生成。
+
+        那个开关的文档语义是「我自己接管容器身份」。但上游 config.json 的
+        兜底生成与属主无关 —— 少了它，上游容器会因读不到配置反复重启，
+        而日志里只有上游的报错，看不出是管理端少走了一步。
+
+        这条锁住结构：开关只出现在「root 且要修属主」这个条件的**同一行**，
+        而且末尾那条 init_upstream_conf 不在任何 if 分支里（两条路径都会走到）。
+        """
+        src = (_ROOT / 'deploy' / 'docker-entrypoint.sh').read_text(encoding='utf-8')
+
+        # 开关不能再有独立的 early-exit 分支（`exec "$@"` 直接跳出脚本）。
+        self.assertNotRegex(
+            src, r'if \[ "\$\{WB_FIX_OWNERSHIP:-1\}" != "1" \]; then\s*\n\s*exec',
+            'WB_FIX_OWNERSHIP=0 不能直接 exec —— 那样首启配置不会生成')
+
+        # 开关应与 root 判定合并在同一个 if 里。
+        self.assertRegex(
+            src, r'if \[ "\$\{WB_FIX_OWNERSHIP:-1\}" = "1" \] && '
+                 r'\[ "\$\(id -u\)" = "0" \]; then',
+            'WB_FIX_OWNERSHIP 应与 root 判定合并在同一个条件里')
+
+        # 末尾那句 init_upstream_conf 必须在顶格（不在任何 if 分支内）：
+        # 顶格 = 该行前导只有空白，且前一个非空行不是 `then`/`else` 之类的分支起始。
+        tail = src.rsplit('init_upstream_conf "" ""', 1)
+        self.assertEqual(2, len(tail), '末尾缺少 init_upstream_conf 兜底调用')
+        last = src.rfind('init_upstream_conf "" ""')
+        line_start = src.rfind('\n', 0, last) + 1
+        self.assertEqual('init_upstream_conf "" ""',
+                         src[line_start:last + len('init_upstream_conf "" ""')].strip(),
+                         '兜底的 init_upstream_conf 应独占一行')
+        self.assertNotIn(src[line_start:last], (' ', '\t'),
+                         '末尾的 init_upstream_conf 不能在 if 分支里（有缩进）—— '
+                         '它在 WB_FIX_OWNERSHIP=0 与非 root 两条路径上都要执行')
 
 
 class BundledUpstreamAssetsTest(unittest.TestCase):
