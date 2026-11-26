@@ -1484,10 +1484,39 @@ async def _chat(request: Request, upstream_path: str):
         # 首字延迟：只记一次，取「首个含正文的 delta」到达时刻。
         # 注意起点含建连 + 上游排队 + 模型开始思考，这正是「上游多久开始回话」。
         first_token_ms: int | None = None
+        # 内容空闲看门狗（issue #485）：按「距上一个**数据帧**」计时，保活帧
+        # （`: keepalive` 这类 SSE 注释）不续命。
+        #
+        # 为什么按数据帧而不是按「正文 delta」：长工具调用（例如生成一个大文件）
+        # 可能连续几分钟只有工具调用增量、没有正文；按正文判会把这类合法请求
+        # 误杀。任何 `data:` 事件都说明上游还在产出，只有纯保活才算空闲。
+        #
+        # 用 monotonic，避免系统时间被 NTP 回拨时把计时器直接跳过。
+        idle_limit = config.STREAM_IDLE_TIMEOUT
+        last_activity_at = time.monotonic()
         try:
             async for chunk in resp.aiter_bytes():
+                # 客户端已经走了就没必要继续占着上游连接与并发名额：断开上游、
+                # 结束生成器。`is_disconnected` 是非阻塞的，每块查一次成本可忽略。
+                if await request.is_disconnected():
+                    error_text = 'client disconnected'
+                    break
                 piece = chunk.decode('utf-8', errors='ignore')
                 raw_stream.feed(piece)
+                if 'data:' in piece:
+                    last_activity_at = time.monotonic()
+                if idle_limit > 0 and time.monotonic() - last_activity_at > idle_limit:
+                    # 连接还活着、保活帧还在来，但正文/工具调用已经停了这么久。
+                    # 继续挂着只会一直占住上游并发名额，客户端那边也只会表现为
+                    # 「毫无响应」。
+                    #
+                    # 这里**只断开、不注入错误帧**：转发热路径必须原样透传上游
+                    # chunk（`test_gateway_source_does_not_rewrite_sse` 守着这条），
+                    # 网关自己构造 SSE 帧会引入重编码与兼容风险。截断由客户端按
+                    # 「流未正常结束」处理，原因写进 request_logs.error。
+                    error_text = ('upstream idle for %ds without content'
+                                  % idle_limit)
+                    break
                 if status_code >= 400:
                     pending += piece
                     # 有数据就留一份：早先要等到 4000 字节才取，而上游的错误体
