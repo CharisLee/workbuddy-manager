@@ -528,6 +528,7 @@ def write_auth_file(account: dict, auth_dir: Path | None = None,
         old_device_token = ''
         old_proxy = ''
         old_weight = None
+        old_skip_tasks = False
         if existed:
             try:
                 old = json.loads(target.read_text(encoding='utf-8'))
@@ -535,6 +536,7 @@ def write_auth_file(account: dict, auth_dir: Path | None = None,
                     old_device_token = str(old.get('device_token') or '')
                     old_proxy = str(old.get('proxy') or '')
                     old_weight = old.get('weight')
+                    old_skip_tasks = old.get('skip_tasks') is True
             except Exception:  # noqa: BLE001
                 old_device_token = ''
 
@@ -571,6 +573,13 @@ def write_auth_file(account: dict, auth_dir: Path | None = None,
         if (isinstance(weight, (int, float)) and not isinstance(weight, bool)
                 and weight > 0):
             payload['weight'] = weight
+
+        # 账号级「不参与定时任务」（issue #437）：与 weight 同一套「文件没提就沿用
+        # 旧值」的语义。重登 / 覆盖导入是按响应重建整份文件，不保留它就会把用户
+        # 的「只转发、不跑任务」静默清掉，企业账号随即又开始白打 400/10001。
+        skip_tasks = account.get('skip_tasks', old_skip_tasks)
+        if skip_tasks is True:
+            payload['skip_tasks'] = True
 
         # 原子替换的完整理由见 `_atomic_write_json`（热加载读到空文件会误判账号被删）
         _atomic_write_json(target, payload)
@@ -640,9 +649,15 @@ async def refresh_token(auth: dict) -> tuple[bool, str, dict]:
     if resp.status_code >= 400:
         if resp.status_code == 429:
             paused = False
+            retry_after = _refresh_retry_after(resp)
             if '_risk_auth_dir' in auth:
                 from . import accountrisk
-                paused = await accountrisk.pause_refresh(str(auth.get('uid') or ''), auth['_risk_auth_dir'], retry_after=_refresh_retry_after(resp))
+                paused = await accountrisk.pause_refresh(
+                    str(auth.get('uid') or ''),
+                    auth['_risk_auth_dir'],
+                    retry_after=retry_after,
+                    detail=f'token refresh throttled (http 429, retry_after={retry_after}s)',
+                )
             return False, ('令牌刷新接口限流（HTTP 429），不是凭证失效；'
                            + ('已保护性暂停该账号，请查看账号预警' if paused else '请查看账号预警，暂停状态尚未确认')), {}
         # 12153 / session dead 的典型表现：refreshToken 也失效了，只能重新登录。
